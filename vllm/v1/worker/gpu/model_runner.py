@@ -19,6 +19,7 @@ instead of embedding feature-specific logic directly.
 
 import functools
 import gc
+import os
 import time
 from copy import deepcopy
 from typing import Any, NamedTuple
@@ -244,6 +245,13 @@ class GPUModelRunner(LoRAModelRunnerMixin):
 
         # Expert parallelism load balancer.
         self.eplb = EPLBController(self.parallel_config, self.device)
+
+        self.debug_kv_cache_tokens = os.environ.get(
+            "VLLM_DEBUG_KV_CACHE_TOKENS", ""
+        ).lower() in ("1", "true", "yes", "on")
+        self.debug_kv_cache_max_tokens = max(
+            1, int(os.environ.get("VLLM_DEBUG_KV_CACHE_MAX_TOKENS", "64"))
+        )
 
     def update_max_model_len(self, max_model_len: int) -> None:
         self.max_model_len = max_model_len
@@ -1055,7 +1063,17 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         num_sampled: torch.Tensor,
         num_rejected: torch.Tensor,
         query_start_loc: torch.Tensor | None = None,
+        input_batch: InputBatch | None = None,
     ) -> None:
+        old_num_computed_tokens = None
+        if self.debug_kv_cache_tokens and input_batch is not None:
+            old_num_computed_tokens = (
+                self.req_states.num_computed_tokens.gpu[input_batch.idx_mapping]
+                .cpu()
+                .numpy()
+                .copy()
+            )
+
         # Update the number of computed tokens.
         if self.is_last_pp_rank:
             assert self.sampler is not None
@@ -1076,6 +1094,58 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         )
 
         self.model_state.postprocess_state(idx_mapping, num_sampled)
+        if old_num_computed_tokens is not None:
+            self._log_kv_cache_token_updates(
+                input_batch=input_batch,
+                old_num_computed_tokens=old_num_computed_tokens,
+                num_rejected=num_rejected,
+                stage="sample",
+            )
+
+    def _log_kv_cache_token_updates(
+        self,
+        input_batch: InputBatch,
+        old_num_computed_tokens: np.ndarray,
+        num_rejected: torch.Tensor | None,
+        stage: str,
+    ) -> None:
+        new_num_computed_tokens = (
+            self.req_states.num_computed_tokens.gpu[input_batch.idx_mapping]
+            .cpu()
+            .numpy()
+        )
+        input_ids = input_batch.input_ids[: input_batch.num_tokens].cpu().tolist()
+        rejected_counts = (
+            num_rejected.cpu().tolist() if num_rejected is not None else None
+        )
+
+        for req_idx, req_id in enumerate(input_batch.req_ids):
+            query_start = int(input_batch.query_start_loc_np[req_idx])
+            query_end = int(input_batch.query_start_loc_np[req_idx + 1])
+            scheduled_tokens = input_ids[query_start:query_end]
+            old_count = int(old_num_computed_tokens[req_idx])
+            new_count = int(new_num_computed_tokens[req_idx])
+            added_count = new_count - old_count
+            added_tokens = scheduled_tokens[:added_count]
+            truncated_tokens = scheduled_tokens[: self.debug_kv_cache_max_tokens]
+            truncated_added_tokens = added_tokens[: self.debug_kv_cache_max_tokens]
+            log_payload = {
+                "stage": stage,
+                "req_id": req_id,
+                #"old_num_computed_tokens": old_count,
+                "new_num_computed_tokens": new_count,
+                "kv_cache_hits": old_count,
+                "kv_cache_misses": added_count,
+                #"added_count": added_count,
+                "scheduled_count": len(scheduled_tokens),
+                #"tokens": truncated_tokens,
+                "added_tokens": truncated_added_tokens,
+                "tokens_truncated": len(scheduled_tokens) > len(truncated_tokens),
+                "added_tokens_truncated": len(added_tokens) > len(truncated_added_tokens),
+            }
+            if rejected_counts is not None:
+                log_payload["rejected_count"] = int(rejected_counts[req_idx])
+            logger.info("kv_cache_update %s", log_payload)
 
     @torch.inference_mode()
     def execute_model(
@@ -1416,6 +1486,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             num_sampled,
             num_rejected,
             input_batch.query_start_loc,
+            input_batch=input_batch,
         )
 
         if self.speculator is not None:
@@ -1503,12 +1574,29 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         return async_output
 
     def postprocess_num_computed_tokens(self, input_batch: InputBatch) -> None:
+        old_num_computed_tokens = None
+        if self.debug_kv_cache_tokens:
+            old_num_computed_tokens = (
+                self.req_states.num_computed_tokens.gpu[input_batch.idx_mapping]
+                .cpu()
+                .numpy()
+                .copy()
+            )
+
         # Update the number of computed tokens.
         post_update_num_computed_tokens(
             input_batch.idx_mapping,
             self.req_states.num_computed_tokens.gpu,
             input_batch.query_start_loc,
         )
+
+        if old_num_computed_tokens is not None:
+            self._log_kv_cache_token_updates(
+                input_batch=input_batch,
+                old_num_computed_tokens=old_num_computed_tokens,
+                num_rejected=None,
+                stage="prefill",
+            )
 
     def shutdown(self) -> None:
         """Release GPU tensors (model weights, KV caches, workspace) so that
