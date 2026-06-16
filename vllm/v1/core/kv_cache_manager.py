@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import itertools
+import logging
 from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Literal, overload
@@ -178,6 +179,27 @@ class KVCacheManager:
             tuple(() for _ in range(self.num_kv_cache_groups))
         )
 
+    def _log_request_block_access(
+        self,
+        request: Request,
+        event: str,
+        block_ids: tuple[list[int], ...] | None,
+        **extra_fields: object,
+    ) -> None:
+        if not logger.isEnabledFor(logging.DEBUG):
+            return
+
+        fields = {
+            "request_id": request.request_id,
+            "event": event,
+            "block_ids": block_ids,
+            **extra_fields,
+        }
+        logger.debug(
+            "KV block access %s",
+            " ".join(f"{key}={value}" for key, value in fields.items()),
+        )
+
     @property
     def usage(self) -> float:
         """Get the KV cache usage.
@@ -239,7 +261,15 @@ class KVCacheManager:
                 preempted=request.num_preemptions > 0,
             )
 
-        return self.create_kv_cache_blocks(computed_blocks), num_new_computed_tokens
+        computed_kv_cache_blocks = self.create_kv_cache_blocks(computed_blocks)
+        self._log_request_block_access(
+            request,
+            "prefix_cache_hit",
+            computed_kv_cache_blocks.get_block_ids(allow_none=True),
+            prefix_cache_hit_tokens=num_new_computed_tokens,
+        )
+
+        return computed_kv_cache_blocks, num_new_computed_tokens
 
     def allocate_slots(
         self,
@@ -438,11 +468,20 @@ class KVCacheManager:
             num_tokens_main_model,
             num_encoder_tokens,
         )
+        new_kv_cache_blocks = self.create_kv_cache_blocks(new_blocks)
+        self._log_request_block_access(
+            request,
+            "allocate_slots",
+            self.get_block_ids(request.request_id),
+            new_block_ids=new_kv_cache_blocks.get_block_ids(allow_none=True),
+            num_new_tokens=num_new_tokens,
+            num_computed_tokens=total_computed_tokens,
+        )
 
         # P/D: delay caching blocks if we have to recv from
         # remote. Update state for locally cached blocks.
         if not self.enable_caching or delay_cache_blocks:
-            return self.create_kv_cache_blocks(new_blocks)
+            return new_kv_cache_blocks
 
         # NOTE(woosuk): We want to commit (cache) up to num_local_computed_tokens
         # + num_external_computed_tokens + num_new_tokens, but must exclude
@@ -455,7 +494,7 @@ class KVCacheManager:
         )
         self.coordinator.cache_blocks(request, num_tokens_to_cache)
 
-        return self.create_kv_cache_blocks(new_blocks)
+        return new_kv_cache_blocks
 
     def free(self, request: Request) -> None:
         """Free the blocks allocated for the request.
