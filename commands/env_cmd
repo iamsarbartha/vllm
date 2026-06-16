@@ -5,3 +5,4 @@ export TRITON_CACHE_DIR=/nethome/sbanerjee76/scratch/.cache/triton
 export TORCHINDUCTOR_CACHE_DIR=/nethome/sbanerjee76/scratch/.cache/torchinductor
 export VLLM_DEBUG_KV_CACHE_TOKENS=1 
 export VLLM_DEBUG_KV_CACHE_MAX_TOKENS=128
+export VLLM_LOGGING_LEVEL=DEBUG
