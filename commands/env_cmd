@@ -1,0 +1,7 @@
+export VLLM_USE_PRECOMPILED=1
+export UV_CACHE_DIR=/nethome/sbanerjee76/scratch/.cache
+export VLLM_CACHE_ROOT=/nethome/sbanerjee76/scratch/.cache/vllm
+export TRITON_CACHE_DIR=/nethome/sbanerjee76/scratch/.cache/triton
+export TORCHINDUCTOR_CACHE_DIR=/nethome/sbanerjee76/scratch/.cache/torchinductor
+export VLLM_DEBUG_KV_CACHE_TOKENS=1 
+export VLLM_DEBUG_KV_CACHE_MAX_TOKENS=128

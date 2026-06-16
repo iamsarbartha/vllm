@@ -1,0 +1,1 @@
+VLLM_USE_PRECOMPILED=1 uv pip install --editable . --torch-backend=auto --cache-dir /nethome/sbanerjee76/scratch/.cache
